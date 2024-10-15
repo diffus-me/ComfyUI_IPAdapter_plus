@@ -1,6 +1,8 @@
 import torch
 import os
 import math
+
+import execution_context
 import folder_paths
 
 import comfy.model_management as model_management
@@ -37,6 +39,7 @@ if "ipadapter" not in folder_paths.folder_names_and_paths:
 else:
     current_paths, _ = folder_paths.folder_names_and_paths["ipadapter"]
 folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
+folder_paths.folder_names_and_paths["loras/ipadapter"] = ([os.path.join(folder_paths.models_dir, "loras/ipadapter")], folder_paths.supported_pt_extensions)
 
 WEIGHT_TYPES = ["linear", "ease in", "ease out", 'ease in-out', 'reverse in-out', 'weak input', 'weak output', 'weak middle', 'strong middle', 'style transfer', 'composition', 'strong style transfer', 'style and composition', 'style transfer precise', 'composition precise']
 
@@ -541,20 +544,24 @@ class IPAdapterUnifiedLoader:
         },
         "optional": {
             "ipadapter": ("IPADAPTER", ),
-        }}
+        },
+        "hidden": {
+            "context": "EXECUTION_CONTEXT"
+        }
+        }
 
     RETURN_TYPES = ("MODEL", "IPADAPTER", )
     RETURN_NAMES = ("model", "ipadapter", )
     FUNCTION = "load_models"
     CATEGORY = "ipadapter"
 
-    def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None):
+    def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None, context: execution_context.ExecutionContext = None):
         pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } }
         if ipadapter is not None:
             pipeline = ipadapter
 
         # 1. Load the clipvision model
-        clipvision_file = get_clipvision_file(preset)
+        clipvision_file = get_clipvision_file(context, preset)
         if clipvision_file is None:
             raise Exception("ClipVision model not found.")
 
@@ -568,7 +575,7 @@ class IPAdapterUnifiedLoader:
 
         # 2. Load the ipadapter model
         is_sdxl = isinstance(model.model, (comfy.model_base.SDXL, comfy.model_base.SDXLRefiner, comfy.model_base.SDXL_instructpix2pix))
-        ipadapter_file, is_insightface, lora_pattern = get_ipadapter_file(preset, is_sdxl)
+        ipadapter_file, is_insightface, lora_pattern = get_ipadapter_file(context, preset, is_sdxl)
         if ipadapter_file is None:
             raise Exception("IPAdapter model not found.")
 
@@ -582,7 +589,7 @@ class IPAdapterUnifiedLoader:
 
         # 3. Load the lora model if needed
         if lora_pattern is not None:
-            lora_file = get_lora_file(lora_pattern)
+            lora_file = get_lora_file(context, lora_pattern)
             lora_model = None
             if lora_file is None:
                 raise Exception("LoRA model not found.")
@@ -625,6 +632,9 @@ class IPAdapterUnifiedLoaderFaceID(IPAdapterUnifiedLoader):
         },
         "optional": {
             "ipadapter": ("IPADAPTER", ),
+        },
+        "hidden": {
+                "context": "EXECUTION_CONTEXT"
         }}
 
     RETURN_NAMES = ("MODEL", "ipadapter", )
@@ -639,21 +649,24 @@ class IPAdapterUnifiedLoaderCommunity(IPAdapterUnifiedLoader):
         },
         "optional": {
             "ipadapter": ("IPADAPTER", ),
+        },"hidden": {
+                "context": "EXECUTION_CONTEXT"
         }}
 
     CATEGORY = "ipadapter/loaders"
 
 class IPAdapterModelLoader:
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required": { "ipadapter_file": (folder_paths.get_filename_list("ipadapter"), )}}
+    def INPUT_TYPES(s, context: execution_context.ExecutionContext):
+        return {"required": { "ipadapter_file": (folder_paths.get_filename_list(context, "ipadapter"), )},
+                "hidden": { "context": "EXECUTION_CONTEXT"}}
 
     RETURN_TYPES = ("IPADAPTER",)
     FUNCTION = "load_ipadapter_model"
     CATEGORY = "ipadapter/loaders"
 
-    def load_ipadapter_model(self, ipadapter_file):
-        ipadapter_file = folder_paths.get_full_path("ipadapter", ipadapter_file)
+    def load_ipadapter_model(self, ipadapter_file, context: execution_context.ExecutionContext):
+        ipadapter_file = folder_paths.get_full_path(context, "ipadapter", ipadapter_file)
         return (ipadapter_model_loader(ipadapter_file),)
 
 class IPAdapterInsightFaceLoader:
@@ -1566,13 +1579,16 @@ class PrepImageForClipVision:
 
 class IPAdapterSaveEmbeds:
     def __init__(self):
-        self.output_dir = folder_paths.get_output_directory()
+        pass
 
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "embeds": ("EMBEDS",),
             "filename_prefix": ("STRING", {"default": "IP_embeds"})
+            },
+            "hidden": {
+                "user_hash": "USER_HASH",
             },
         }
 
@@ -1581,8 +1597,9 @@ class IPAdapterSaveEmbeds:
     OUTPUT_NODE = True
     CATEGORY = "ipadapter/embeds"
 
-    def save(self, embeds, filename_prefix):
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+    def save(self, embeds, filename_prefix, user_hash):
+        output_dir = folder_paths.get_output_directory(user_hash)
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_dir)
         file = f"{filename}_{counter:05}.ipadpt"
         file = os.path.join(full_output_folder, file)
 
@@ -1591,17 +1608,18 @@ class IPAdapterSaveEmbeds:
 
 class IPAdapterLoadEmbeds:
     @classmethod
-    def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
+    def INPUT_TYPES(s, user_hash: str):
+        input_dir = folder_paths.get_input_directory(user_hash)
         files = [os.path.relpath(os.path.join(root, file), input_dir) for root, dirs, files in os.walk(input_dir) for file in files if file.endswith('.ipadpt')]
-        return {"required": {"embeds": [sorted(files), ]}, }
+        return {"required": {"embeds": [sorted(files), ]}, 
+                "hidden": {"user_hash": "USER_HASH"}}
 
     RETURN_TYPES = ("EMBEDS", )
     FUNCTION = "load"
     CATEGORY = "ipadapter/embeds"
 
-    def load(self, embeds):
-        path = folder_paths.get_annotated_filepath(embeds)
+    def load(self, embeds, user_hash):
+        path = folder_paths.get_annotated_filepath(embeds, user_hash)
         return (torch.load(path).cpu(), )
 
 class IPAdapterWeights:
